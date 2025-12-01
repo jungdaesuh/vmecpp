@@ -55,14 +55,10 @@ int signum(int x) {
   return (x > 0) - (x < 0);
 }
 
-void TridiagonalSolveSerial(std::span<double> m_a, std::span<double> m_d,
-                            std::span<double> m_b, double *m_c_data,
-                            int c_stride, int jMin, int jMax, int nRHS) {
-  // Helper lambda to access c[k][j] in the flat layout
-  auto c = [m_c_data, c_stride](int k, int j) -> double & {
-    return m_c_data[k * c_stride + j];
-  };
-
+void TridiagonalSolveSerial(std::vector<double> &m_a, std::vector<double> &m_d,
+                            std::vector<double> &m_b,
+                            std::vector<std::vector<double>> &m_c, int jMin,
+                            int jMax, int nRHS) {
   // If jMin > 0, need to fill in the upper left corner of the matrix
   // with non-intrusive variables that do not change the solution of the system.
   // Thus, put the diagonal elements d to 1 (= implied identity matrix),
@@ -73,7 +69,7 @@ void TridiagonalSolveSerial(std::span<double> m_a, std::span<double> m_d,
     m_d[j] = 1.0;
     m_b[j] = 0.0;
     for (int k = 0; k < nRHS; ++k) {
-      c(k, j) = 0.0;
+      m_c[k][j] = 0.0;
     }  // k
   }  // j
 
@@ -96,18 +92,18 @@ void TridiagonalSolveSerial(std::span<double> m_a, std::span<double> m_d,
 
   for (int k = 0; k < nRHS; ++k) {
     // d has not been modified here, so no need to re-check for division-by-zero
-    c(k, jMin) /= m_d[jMin];
+    m_c[k][jMin] /= m_d[jMin];
 
     for (int j = jMin + 1; j < jMax; ++j) {
       const double denominator = m_d[j] - m_a[j - 1] * m_b[j];
       if (denominator == 0.0) {
         LOG(FATAL) << "d[j] - a[j - 1] * b[j] == 0.0 at j = " << j;
       }
-      c(k, j) = (c(k, j) - c(k, j - 1) * m_b[j]) / denominator;
+      m_c[k][j] = (m_c[k][j] - m_c[k][j - 1] * m_b[j]) / denominator;
     }  // j
 
     for (int j = jMax - 2; j > jMin - 1; --j) {
-      c(k, j) -= m_a[j] * c(k, j + 1);
+      m_c[k][j] -= m_a[j] * m_c[k][j + 1];
     }  // j
   }  // k
 }

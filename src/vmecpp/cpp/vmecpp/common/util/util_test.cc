@@ -46,9 +46,8 @@ TEST_P(TridiagonalSolverSerialTest, CheckTridiagonalSolverSerial) {
   std::vector<double> matDiag(kMatrixDimension, 0.0);
   std::vector<double> matDiagUp(kMatrixDimension, 0.0);
 
-  // RHS stored in flat layout: [k * kMatrixDimension + j]
-  // where k is the RHS index and j is the matrix row index
-  std::vector<double> rhs(kNumberOfRightHandSides * kMatrixDimension, 0.0);
+  std::vector<std::vector<double>> rhs(kNumberOfRightHandSides);
+  rhs[0].resize(kMatrixDimension);
 
   // desired solution vector
   std::vector<double> x(kMatrixDimension, 0.0);
@@ -79,30 +78,29 @@ TEST_P(TridiagonalSolverSerialTest, CheckTridiagonalSolverSerial) {
   }
 
   // compute RHS for known solution
-  // Access pattern: rhs[k][i] = rhs[k * kMatrixDimension + i]
   for (int i = 0; i < kMatrixDimension; ++i) {
     if (i < kMatrixDimension - 1) {
       // sup-diagonal
-      rhs[i] += matDiagUp[i] * x[i + 1];
+      rhs[0][i] += matDiagUp[i] * x[i + 1];
     }
 
     // diagonal
-    rhs[i] += matDiag[i] * x[i];
+    rhs[0][i] += matDiag[i] * x[i];
 
     if (i > 0) {
       // sub-diagonal
-      rhs[i] += matDiagLow[i] * x[i - 1];
+      rhs[0][i] += matDiagLow[i] * x[i - 1];
     }
   }
 
   int jMin = 0;
   int jMax = kMatrixDimension;
-  TridiagonalSolveSerial(matDiagUp, matDiag, matDiagLow, rhs.data(),
-                         kMatrixDimension, jMin, jMax, kNumberOfRightHandSides);
+  TridiagonalSolveSerial(matDiagUp, matDiag, matDiagLow, rhs, jMin, jMax,
+                         kNumberOfRightHandSides);
 
   // check that solution is correct
   for (int i = 0; i < kMatrixDimension; ++i) {
-    EXPECT_TRUE(IsCloseRelAbs(x[i], rhs[i], kTolerance));
+    EXPECT_TRUE(IsCloseRelAbs(x[i], rhs[0][i], kTolerance));
   }
 }  // CheckTridiagonalSolverSerial
 
