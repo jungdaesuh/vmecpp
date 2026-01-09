@@ -167,6 +167,7 @@ ignore = [
 include = ["src"]
 exclude = ["build", "**/__pycache__", "src/vmecpp/cpp/bazel-cpp/"]
 pythonVersion = "3.10"
+stubPath = "typings"
 venvPath = "."
 venv = ".venv"
 
