@@ -162,6 +162,7 @@ ignore = [
 "tests/**" = ["T20"]
 "**/*_test.py" = ["T20"]
 "examples/**" = ["T201"]
+"src/vmecpp/__init__.py" = ["UP038"]
 
 [tool.pyright]
 include = ["src"]

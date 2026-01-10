@@ -1278,7 +1278,7 @@ class VmecWOut(BaseModelWithNumpy):
                         # max_length, could be generalized
                         max_len = field_info.metadata[0].max_length
                     # No max_length metadata, dynamic length
-                    elif isinstance(value, bytes | np.bytes_):
+                    elif isinstance(value, (bytes, np.bytes_)):
                         max_len = len(value.decode(encoding="ascii"))
                     else:
                         max_len = len(value)
@@ -1290,7 +1290,7 @@ class VmecWOut(BaseModelWithNumpy):
                     string_variable = fnc.createVariable(field, "S1", (dim_name,))
 
                     # Put the string in the format netCDF3 requires. Don't know what to say.
-                    if isinstance(value, bytes | np.bytes_):
+                    if isinstance(value, (bytes, np.bytes_)):
                         value_str = value.decode(encoding="ascii")
                     else:
                         value_str = value
