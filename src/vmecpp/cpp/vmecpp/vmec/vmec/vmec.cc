@@ -112,7 +112,12 @@ absl::StatusOr<vmecpp::OutputQuantities> vmecpp::run(
     const VmecINDATA& indata, std::optional<HotRestartState> initial_state,
     std::optional<int> max_threads, OutputMode verbose,
     InterruptCallback interrupt_callback) {
-  Vmec v = Vmec(indata, max_threads, verbose, std::move(interrupt_callback));
+  auto maybe_vmec = Vmec::FromIndata(indata, nullptr, max_threads, verbose,
+                                     std::move(interrupt_callback));
+  if (!maybe_vmec.ok()) {
+    return maybe_vmec.status();
+  }
+  Vmec& v = **maybe_vmec;
 
   // the values of the first three arguments should just be VMEC's defaults
   absl::StatusOr<bool> s =
@@ -131,11 +136,13 @@ absl::StatusOr<vmecpp::OutputQuantities> vmecpp::run(
     std::optional<HotRestartState> initial_state,
     std::optional<int> max_threads, OutputMode verbose,
     InterruptCallback interrupt_callback) {
-  Vmec v(indata, max_threads, verbose, std::move(interrupt_callback));
-  absl::Status mgrid_status = v.LoadMGrid(magnetic_response_table);
-  if (!mgrid_status.ok()) {
-    return mgrid_status;
+  auto maybe_vmec =
+      Vmec::FromIndata(indata, &magnetic_response_table, max_threads, verbose,
+                       std::move(interrupt_callback));
+  if (!maybe_vmec.ok()) {
+    return maybe_vmec.status();
   }
+  Vmec& v = **maybe_vmec;
 
   // the values of the first three arguments should just be VMEC's defaults
   absl::StatusOr<bool> s =
@@ -150,6 +157,32 @@ absl::StatusOr<vmecpp::OutputQuantities> vmecpp::run(
 
 namespace vmecpp {
 
+absl::StatusOr<std::unique_ptr<Vmec>> Vmec::FromIndata(
+    const VmecINDATA& indata,
+    const makegrid::MagneticFieldResponseTable* magnetic_response_table,
+    std::optional<int> max_threads, OutputMode verbose,
+    InterruptCallback interrupt_callback) {
+  auto v = std::make_unique<Vmec>(indata, max_threads, verbose,
+                                  std::move(interrupt_callback));
+
+  // This part of Vmec initialization requires Status handling, and is therefore
+  // in this factory method instead of the constructor.
+  if (indata.lfreeb) {
+    absl::Status s{};
+    if (magnetic_response_table == nullptr) {
+      s = v->mgrid_.LoadFile(indata.mgrid_file, indata.extcur);
+    } else {
+      s = v->mgrid_.LoadFields(*magnetic_response_table, indata.extcur);
+    }
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  return v;
+}
+
+// initialize based on input file contents
 Vmec::Vmec(const VmecINDATA& indata, std::optional<int> max_threads,
            OutputMode verbose, InterruptCallback interrupt_callback)
     : indata_(indata),
@@ -179,16 +212,14 @@ Vmec::Vmec(const VmecINDATA& indata, std::optional<int> max_threads,
     // 0 : (mpol + 1)
     int mf = s_.mpol + 1;
     int mnpd = (2 * nf + 1) * (mf + 1);
-    matrixShare.resize(mnpd * mnpd, 0.0);
-    iPiv.resize(mnpd, 0);
-    bvecShare.resize(mnpd, 0.0);
+    matrixShare.setZero(mnpd * mnpd);
+    iPiv.setZero(mnpd);
+    bvecShare.setZero(mnpd);
 
-    // not so nice to do this here, but meh...
-    h_.vacuum_magnetic_pressure.resize(s_.nZnT, 0.0);
-
-    h_.vacuum_b_r.resize(s_.nZnT);
-    h_.vacuum_b_phi.resize(s_.nZnT);
-    h_.vacuum_b_z.resize(s_.nZnT);
+    h_.vacuum_magnetic_pressure.setZero(s_.nZnT);
+    h_.vacuum_b_r.setZero(s_.nZnT);
+    h_.vacuum_b_phi.setZero(s_.nZnT);
+    h_.vacuum_b_z.setZero(s_.nZnT);
 
     // TODO(jons): move this check to better-suited place
     if (indata_.free_boundary_method == FreeBoundaryMethod::ONLY_COILS &&
@@ -201,26 +232,6 @@ Vmec::Vmec(const VmecINDATA& indata, std::optional<int> max_threads,
   }
 }
 
-absl::Status Vmec::LoadMGrid(
-    const makegrid::MagneticFieldResponseTable& magnetic_response_table) {
-  if (!fc_.lfreeb) {
-    return absl::InvalidArgumentError(
-        "The MGridProvider is only required for free-boundary VMEC++ runs.");
-  }
-
-  return mgrid_.LoadFields(magnetic_response_table.parameters,
-                           magnetic_response_table, indata_.extcur);
-}
-
-absl::Status Vmec::LoadMGrid() {
-  if (!fc_.lfreeb) {
-    return absl::InvalidArgumentError(
-        "The MGridProvider is only required for free-boundary VMEC++ runs.");
-  }
-
-  return mgrid_.LoadFile(indata_.mgrid_file, indata_.extcur);
-}
-
 // main worker method; equivalent of vmec.f90
 // checked visually to comply with vmec.f90
 absl::StatusOr<bool> Vmec::run(const VmecCheckpoint& checkpoint,
@@ -229,9 +240,9 @@ absl::StatusOr<bool> Vmec::run(const VmecCheckpoint& checkpoint,
                                std::optional<HotRestartState> initial_state) {
   if (indata_.lfreeb) {
     if (!mgrid_.IsLoaded()) {
-      // if we have a free-boundary VMEC run, we may need to load the
-      // magnetic field response table
-      absl::Status status = LoadMGrid();
+      // Fallback: load mgrid from file if constructed directly via the public
+      // constructor instead of the FromIndata factory method.
+      absl::Status status = mgrid_.LoadFile(indata_.mgrid_file, indata_.extcur);
       if (!status.ok()) {
         return status;
       }
@@ -393,7 +404,7 @@ absl::StatusOr<bool> Vmec::run(const VmecCheckpoint& checkpoint,
     summary.fsqz = w.fsqz;
     summary.fsql = w.fsql;
     summary.ftolv = fc_.ftolv;
-    summary.betatot = w.betatot;
+    summary.betatot = w.betatotal;
     summary.betapol = w.betapol;
     summary.betator = w.betator;
     summary.w_mhd = h_.mhdEnergy * 4.0 * M_PI * M_PI;
@@ -515,14 +526,24 @@ bool Vmec::InitializeRadial(
 
         if (indata_.free_boundary_method == FreeBoundaryMethod::NESTOR) {
           fb_[thread_id] = std::make_unique<Nestor>(
-              &s_, tp_[thread_id].get(), &mgrid_, matrixShare, bvecShare,
-              h_.vacuum_magnetic_pressure, iPiv, h_.vacuum_b_r, h_.vacuum_b_phi,
-              h_.vacuum_b_z);
+              &s_, tp_[thread_id].get(), &mgrid_,
+              std::span<double>(matrixShare.data(), matrixShare.size()),
+              std::span<double>(bvecShare.data(), bvecShare.size()),
+              std::span<double>(h_.vacuum_magnetic_pressure.data(),
+                                h_.vacuum_magnetic_pressure.size()),
+              std::span<int>(iPiv.data(), iPiv.size()),
+              std::span<double>(h_.vacuum_b_r.data(), h_.vacuum_b_r.size()),
+              std::span<double>(h_.vacuum_b_phi.data(), h_.vacuum_b_phi.size()),
+              std::span<double>(h_.vacuum_b_z.data(), h_.vacuum_b_z.size()));
         } else if (indata_.free_boundary_method ==
                    FreeBoundaryMethod::ONLY_COILS) {
           fb_[thread_id] = std::make_unique<OnlyCoils>(
-              &s_, tp_[thread_id].get(), &mgrid_, h_.vacuum_magnetic_pressure,
-              h_.vacuum_b_r, h_.vacuum_b_phi, h_.vacuum_b_z);
+              &s_, tp_[thread_id].get(), &mgrid_,
+              std::span<double>(h_.vacuum_magnetic_pressure.data(),
+                                h_.vacuum_magnetic_pressure.size()),
+              std::span<double>(h_.vacuum_b_r.data(), h_.vacuum_b_r.size()),
+              std::span<double>(h_.vacuum_b_phi.data(), h_.vacuum_b_phi.size()),
+              std::span<double>(h_.vacuum_b_z.data(), h_.vacuum_b_z.size()));
         } else {
           LOG(FATAL) << absl::StrCat("free boundary method '",
                                      ToString(indata_.free_boundary_method),
@@ -1184,12 +1205,15 @@ absl::StatusOr<bool> Vmec::Evolve(VmecCheckpoint checkpoint,
     if (iter2_ == iter1_) {
       // initialize all entries in otau to 0.15/time_step --> required for
       // averaging otau: "over" tau --> 1/tau ???
-      absl::c_fill(invTau_, 0.15 / time_step);
+      invTau_.setConstant(0.15 / time_step);
     }
 
     // shift elements for averaging to the left to make space at end for new
     // entry (oldest entry ends up at the end and will be overwritten later)
-    absl::c_rotate(invTau_, invTau_.begin() + 1);
+    {
+      Eigen::VectorXd tmp = invTau_.tail(invTau_.size() - 1);
+      invTau_.head(invTau_.size() - 1) = tmp;
+    }
 
     if (iter2_ > iter1_) {
       double invtau_numerator = 0.;
@@ -1201,7 +1225,7 @@ absl::StatusOr<bool> Vmec::Evolve(VmecCheckpoint checkpoint,
 
       // overwrite oldest entry (at last index after rotation above) with the
       // new value of 1/tau
-      invTau_.back() = invtau_numerator / time_step;
+      invTau_[invTau_.size() - 1] = invtau_numerator / time_step;
     }
 
     // update backup copy of fsq1 --> here, fsq is fsq1 of previous iteration
@@ -1225,7 +1249,7 @@ absl::StatusOr<bool> Vmec::Evolve(VmecCheckpoint checkpoint,
   }
 
   // averaging over ndamp entries : 1/ndamp*sum(invTau)
-  const double otav = absl::c_accumulate(invTau_, 0.) / kNDamp;
+  const double otav = invTau_.sum() / kNDamp;
 
   const double dtau = time_step * otav / 2.0;
   const double b1 = 1.0 - dtau;
@@ -1612,11 +1636,11 @@ void Vmec::performTimeStep(const Sizes& s, const FlowControl& fc,
 
 void Vmec::InterpolateToNextMultigridStep(
     int ns_new, int ns_old,
-    const std::vector<std::unique_ptr<RadialProfiles> >& p,
-    const std::vector<std::unique_ptr<RadialPartitioning> >& r_new,
-    const std::vector<std::unique_ptr<RadialPartitioning> >& r_old,
-    std::vector<std::unique_ptr<FourierGeometry> >& m_x_new,
-    std::vector<std::unique_ptr<FourierGeometry> >& m_x_old) {
+    const std::vector<std::unique_ptr<RadialProfiles>>& p,
+    const std::vector<std::unique_ptr<RadialPartitioning>>& r_new,
+    const std::vector<std::unique_ptr<RadialPartitioning>>& r_old,
+    std::vector<std::unique_ptr<FourierGeometry>>& m_x_new,
+    std::vector<std::unique_ptr<FourierGeometry>>& m_x_old) {
   // INTERPOLATE R,Z AND LAMBDA ON FULL GRID
   // (EXTRAPOLATE M=1 MODES,OVER SQRT(S), TO ORIGIN)
   // ON ENTRY, XOLD = X(COARSE MESH) * SCALXC(COARSE MESH)

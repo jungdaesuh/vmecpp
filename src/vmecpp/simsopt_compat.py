@@ -472,6 +472,15 @@ class Vmec(Optimizable):
         )
         vi.rbc.fill(0.0)
         vi.zbs.fill(0.0)
+        rbs = None
+        zbc = None
+        if vi.lasym:
+            assert vi.rbs is not None
+            assert vi.zbc is not None
+            rbs = vi.rbs
+            zbc = vi.zbc
+            rbs.fill(0.0)
+            zbc.fill(0.0)
 
         # Transfer boundary shape data from the surface object to VMEC:
         ntor = self.indata.ntor
@@ -479,6 +488,9 @@ class Vmec(Optimizable):
             for n in range(2 * ntor + 1):
                 vi.rbc[m, n] = boundary_RZFourier.get_rc(m, n - ntor)
                 vi.zbs[m, n] = boundary_RZFourier.get_zs(m, n - ntor)
+                if rbs is not None and zbc is not None:
+                    rbs[m, n] = boundary_RZFourier.get_rs(m, n - ntor)
+                    zbc[m, n] = boundary_RZFourier.get_zc(m, n - ntor)
 
         # NOTE: The following comment is from VMEC2000.
         # Set axis shape to something that is obviously wrong (R=0) to
@@ -542,6 +554,15 @@ class Vmec(Optimizable):
             self.boundary, mpol_for_surfacerzfourier, ntor_for_surfacerzfourier
         )
         if updated_boundary is not self.boundary:
+            old_boundary = self.boundary
+            # Transfer children (other than self) from old boundary to new boundary
+            # to preserve the optimization dependency chain.
+            # self (Vmec) is excluded here; the boundary setter handles it below.
+            old_children = [c() for c in old_boundary._children if c() is not None]
+            for child in old_children:
+                if child is not self:
+                    child.remove_parent(old_boundary)
+                    child.append_parent(updated_boundary)
             self.boundary = updated_boundary
         self.recompute_bell()
 

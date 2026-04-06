@@ -3,13 +3,16 @@
 # SPDX-License-Identifier: MIT
 """Tests for VMEC++'s'SIMSOPT compatibility layer."""
 
+import json
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 import netCDF4
 import numpy as np
 import pytest
 from simsopt import mhd as simsopt_mhd
+from simsopt._core.optimizable import Optimizable
 from simsopt.geo import SurfaceRZFourier
 
 from vmecpp import _util, ensure_vmec2000_input, simsopt_compat
@@ -144,6 +147,19 @@ def _assign_low_res_boundary(vmec: simsopt_compat.Vmec) -> SurfaceRZFourier:
     return boundary
 
 
+def _make_asymmetric_vmec() -> simsopt_compat.Vmec:
+    vmec = simsopt_compat.Vmec(TEST_DATA_DIR / "input.up_down_asymmetric_tokamak")
+    assert vmec.indata is not None
+    assert vmec.indata.lasym
+    assert vmec.indata.rbs is not None
+    assert vmec.indata.zbc is not None
+    return vmec
+
+
+def _get_input_json(vmec: simsopt_compat.Vmec) -> dict[str, object]:
+    return json.loads(vmec.get_input())
+
+
 def test_run_preserves_assigned_boundary_identity_and_dofs():
     vmec = simsopt_compat.Vmec(TEST_DATA_DIR / "li383_low_res.json")
     surf = _assign_low_res_boundary(vmec)
@@ -165,6 +181,37 @@ def test_assigned_boundary_stays_connected_after_run():
     assert vmec.need_to_run_code
 
 
+def test_set_mpol_ntor_preserves_children_of_boundary():
+    """Other Optimizable objects that depend on the boundary stay connected after
+    set_mpol_ntor forces a boundary resize.
+
+    In the current simsopt, SurfaceRZFourier.change_resolution() modifies the surface
+    in-place and returns None, so the boundary object identity is preserved. This test
+    mocks change_resolution to return a new object, exercising the defensive children-
+    transfer code path for surface types that create a new object.
+    """
+
+    vmec = simsopt_compat.Vmec(TEST_DATA_DIR / "li383_low_res.json")
+    surf = _assign_low_res_boundary(vmec)  # mpol=1, ntor=1, different from indata
+
+    # Create a second dependent that also listens to surf
+    dependent = Optimizable(depends_on=[surf])
+    assert surf in dependent.parents
+
+    # Simulate change_resolution returning a new surface object (non-in-place resize)
+    target_mpol, target_ntor = 3, 3  # _surface_rzfourier_resolution(4, 3) = (3, 3)
+    replacement = SurfaceRZFourier(mpol=target_mpol, ntor=target_ntor, nfp=surf.nfp)
+    with patch.object(surf, "change_resolution", return_value=replacement):
+        vmec.set_mpol_ntor(new_mpol=4, new_ntor=3)
+
+    new_surf = vmec.boundary
+    assert new_surf is replacement  # New surface was installed
+
+    # dependent should now point to new_surf, not the stale surf
+    assert new_surf in dependent.parents
+    assert surf not in dependent.parents
+
+
 def test_get_input_preserves_assigned_boundary_identity_and_dofs():
     vmec = simsopt_compat.Vmec(TEST_DATA_DIR / "li383_low_res.json")
     surf = _assign_low_res_boundary(vmec)
@@ -175,6 +222,33 @@ def test_get_input_preserves_assigned_boundary_identity_and_dofs():
     assert indata_json
     assert vmec.boundary is surf
     assert len(vmec.x) == original_num_dofs
+
+
+def test_set_indata_writes_and_clears_asymmetric_rbs_coefficients():
+    vmec = _make_asymmetric_vmec()
+    indata = vmec.indata
+    assert indata is not None
+    assert indata.rbs is not None
+
+    vmec.boundary.set_rs(1, 0, 0.723)
+    vmec.set_indata()
+    np.testing.assert_allclose(indata.rbs[1, 0], 0.723)
+
+    vmec.boundary.set_rs(1, 0, 0.0)
+    vmec.set_indata()
+    np.testing.assert_allclose(indata.rbs[1, 0], 0.0)
+
+
+def test_get_input_writes_and_clears_asymmetric_zbc_coefficients():
+    vmec = _make_asymmetric_vmec()
+
+    vmec.boundary.set_zc(0, 0, 0.456)
+    indata_json = _get_input_json(vmec)
+    assert indata_json["zbc"] == [{"m": 0, "n": 0, "value": 0.456}]
+
+    vmec.boundary.set_zc(0, 0, 0.0)
+    indata_json = _get_input_json(vmec)
+    assert indata_json["zbc"] == []
 
 
 def test_changing_mpol_ntor(vmec):

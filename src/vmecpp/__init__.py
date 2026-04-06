@@ -33,16 +33,38 @@ logger = logging.getLogger(__name__)
 _ArrayType = typing.TypeVar("_ArrayType")
 
 
+def _wrap_dense_to_sparse(
+    value: typing.Any,
+    handler: pydantic.SerializerFunctionWrapHandler,
+    _: pydantic.FieldSerializationInfo,
+) -> list[dict[str, float | int]]:
+    # Handle ndarray directly, and also lists (which arise when the base class
+    # _serialize_field wrap serializer converts ndarray -> list before this runs).
+    if isinstance(value, (np.ndarray, list)):
+        return _util.dense_to_sparse_coefficients(np.asarray(value))
+    return handler(value)
+
+
 SerializableSparseCoefficientArray: typing.TypeAlias = typing.Annotated[
     _ArrayType,
-    pydantic.PlainSerializer(
-        _util.dense_to_sparse_coefficients, when_used="unless-none"
-    ),
+    pydantic.WrapSerializer(_wrap_dense_to_sparse, when_used="unless-none"),  # pyright: ignore[reportArgumentType]
     pydantic.BeforeValidator(_util.sparse_to_dense_coefficients_implicit),
 ]
+
+
+def _wrap_int_as_float(
+    value: typing.Any,
+    handler: pydantic.SerializerFunctionWrapHandler,
+    _: pydantic.FieldSerializationInfo,
+) -> list[float]:
+    if isinstance(value, (np.ndarray, list)):
+        return np.array(value).astype(np.float64).tolist()
+    return handler(value)
+
+
 SerializeIntAsFloat: typing.TypeAlias = typing.Annotated[
     _ArrayType,
-    pydantic.PlainSerializer(lambda x: np.array(x).astype(np.float64).tolist()),
+    pydantic.WrapSerializer(_wrap_int_as_float),  # pyright: ignore[reportArgumentType]
     pydantic.BeforeValidator(lambda x: np.array(x).astype(np.int64)),
 ]
 
@@ -642,61 +664,21 @@ class VmecWOut(BaseModelWithNumpy):
     )
 
     _CPP_WOUT_SPECIAL_HANDLING: typing.ClassVar[list[str]] = [
-        "niter",
-        "signgs",
-        "betatotal",
-        "volavgB",
-        "iotaf",
-        "q_factor",
-        "presf",
-        "phi",
-        "chi",
-        "beta_vol",
-        "specw",
-        "DShear",
-        "DWell",
-        "DCurr",
-        "DGeod",
-        "raxis_cc",
-        "zaxis_cs",
+        # Asymmetric-only fields (None when lasym=False)
         "raxis_cs",
         "zaxis_cc",
-        "version_",
-        "bvco",
-        "buco",
-        "vp",
-        "volume",
-        "pres",
-        "mass",
-        "phips",
-        "over_r",
-        "iotas",
-        "rmnc",
-        "zmns",
         "rmns",
         "zmnc",
-        "lmnc",
         "lmnc_full",
-        "bsubsmns",
-        "lmns_full",
-        "lmns",
-        "bmnc",
-        "bsubumnc",
-        "bsubvmnc",
-        "bsupumnc",
-        "bsupvmnc",
-        "gmnc",
-        "rmns",
-        "zmnc",
+        "bsubsmnc",
+        # Asymmetric half-grid 2D arrays (None when lasym=False)
+        "lmnc",
         "gmns",
         "bmns",
         "bsubumns",
         "bsubvmns",
-        "bsubsmnc",
         "bsupumns",
         "bsupvmns",
-        "restart_reason_timetrace",
-        "lrfp",
     ]
     """If quantities are not exactly the same in C++ WoutFileContents and this class,
     add them to this list and implement the conversion logic in _to_cpp_wout and
@@ -1104,8 +1086,12 @@ class VmecWOut(BaseModelWithNumpy):
     extcur: typing.Annotated[
         jt.Float[np.ndarray, "ext_current"],
         pydantic.BeforeValidator(lambda x: x if np.shape(x) != () else np.array([])),
-        pydantic.PlainSerializer(
-            lambda x: x if np.shape(x) != (0,) else netCDF4.default_fillvals["f8"]
+        pydantic.WrapSerializer(
+            lambda x, handler, _: (
+                netCDF4.default_fillvals["f8"]
+                if isinstance(x, (np.ndarray, list)) and np.shape(x) == (0,)
+                else handler(x)
+            )
         ),
     ]
     """Coil currents in A.
@@ -1118,15 +1104,12 @@ class VmecWOut(BaseModelWithNumpy):
     """Indicates if the mgrid file was normalized to unit currents ("S") or not
     ("R")."""
 
-    # In the C++ WOutFileContents this is called iota_half.
     iotas: jt.Float[np.ndarray, "n_surfaces"]
     r"""Rotational transform :math:`\iota` on the half-grid."""
 
-    # In the C++ WOutFileContents this is called iota_full.
     iotaf: jt.Float[np.ndarray, "n_surfaces"]
     r"""Rotational transform :math:`\iota` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called betatot.
     betatotal: float
     r"""Total plasma beta.
 
@@ -1136,102 +1119,78 @@ class VmecWOut(BaseModelWithNumpy):
     )`
     """
 
-    # In the C++ WOutFileContents this is called raxis_c.
     raxis_cc: jt.Float[np.ndarray, "ntor_plus_1"]
     """Fourier coefficients of :math:`R(phi)` of the magnetic axis geometry."""
 
-    # In the C++ WOutFileContents this is called zaxis_s.
     zaxis_cs: jt.Float[np.ndarray, "ntor_plus_1"]
     """Fourier coefficients of :math:`Z(phi)` of the magnetic axis geometry."""
 
-    # In the C++ WOutFileContents this is called raxis_s.
     raxis_cs: jt.Float[np.ndarray, "ntor_plus_1"] | None = None
     """Fourier coefficients of :math:`R(phi)` of the magnetic axis geometry; non-
     stellarator-symmetric."""
 
-    # In the C++ WOutFileContents this is called zaxis_c.
     zaxis_cc: jt.Float[np.ndarray, "ntor_plus_1"] | None = None
     """Fourier coefficients of :math:`Z(phi)` of the magnetic axis geometry; non-
     stellarator-symmetric."""
 
-    # In the C++ WOutFileContents this is called dVds.
     vp: jt.Float[np.ndarray, "n_surfaces"]
-    r"""Differential volume :math:`V' = \frac{\partial V}{\partial s}` on half-grid.
+    r"""Differential volume :math:`V' = \frac{\partial V}{\partial s}` on half-grid."""
 
-    Note: called ``dVds`` in cpp
-    """
-
-    # In the C++ WOutFileContents this is called pressure_full.
     presf: jt.Float[np.ndarray, "n_surfaces"]
     """Kinetic pressure ``p`` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called pressure_half.
     pres: jt.Float[np.ndarray, "n_surfaces"]
     """Kinetic pressure ``p`` on the half-grid."""
 
-    # In the C++ WOutFileContents this is called toroidal_flux.
     phi: jt.Float[np.ndarray, "n_surfaces"]
     r"""Enclosed toroidal magnetic flux :math:`\phi` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called sign_of_jacobian.
     signgs: int
     """Sign of the Jacobian of the coordinate transform between flux coordinates and
     cylindrical coordinates."""
 
-    # In the C++ WOutFileContents this is called VolAvgB.
     volavgB: float
     """Volume-averaged magnetic field strength."""
 
-    # In the C++ WOutFileContents this is called safety_factor.
     # Defaulted for backwards compatibility with old wout files.
     q_factor: jt.Float[np.ndarray, "n_surfaces"] = pydantic.Field(
         default_factory=lambda: np.array([])
     )
     r"""Safety factor :math:`q = 1/\iota` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called poloidal_flux.
     # Defaulted for backwards compatibility with old wout files.
     chi: jt.Float[np.ndarray, "n_surfaces"] = pydantic.Field(
         default_factory=lambda: np.array([])
     )
     r"""Enclosed poloidal magnetic flux :math:`\chi` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called spectral_width.
     specw: jt.Float[np.ndarray, "n_surfaces"]
     """Spectral width ``M`` on the full-grid."""
 
-    # In the C++ WOutFileContents this is called overr.
     over_r: jt.Float[np.ndarray, "n_surfaces"]
     r"""``<\tau / R> / V'`` on half-grid.
 
     :math:`\left\langle \frac{\tau}{R} \right\rangle / V'`
     """
 
-    # In the C++ WOutFileContents this is called Dshear.
     DShear: jt.Float[np.ndarray, "n_surfaces"]
     """Mercier stability criterion contribution due to magnetic shear."""
 
-    # In the C++ WOutFileContents this is called Dwell.
     DWell: jt.Float[np.ndarray, "n_surfaces"]
     """Mercier stability criterion contribution due to magnetic well."""
 
-    # In the C++ WOutFileContents this is called Dcurr.
     DCurr: jt.Float[np.ndarray, "n_surfaces"]
     """Mercier stability criterion contribution due to plasma currents."""
 
-    # In the C++ WOutFileContents this is called Dgeod.
     DGeod: jt.Float[np.ndarray, "n_surfaces"]
     """Mercier stability criterion contribution due to geodesic curvature."""
 
-    # In the C++ WOutFileContents this is called maximum_iterations.
     niter: int
     """Maximum number of force-balance iterations allowed."""
 
-    # In the C++ WOutFileContents this is called beta.
     beta_vol: jt.Float[np.ndarray, "n_surfaces"]
     """Flux-surface averaged plasma beta on half-grid."""
 
-    # In the C++ WOutFileContents this is called 'version' and it is a string.
     version_: float
     """Version number of VMEC, that this VMEC++ wout file is compatible with.
 
@@ -1431,106 +1390,26 @@ class VmecWOut(BaseModelWithNumpy):
             if field not in VmecWOut._CPP_WOUT_SPECIAL_HANDLING:
                 attrs[field] = getattr(cpp_wout, field)
 
-        attrs["volume"] = cpp_wout.volume_p
-
-        # These attributes are called differently
-        attrs["niter"] = cpp_wout.maximum_iterations
-        attrs["signgs"] = cpp_wout.sign_of_jacobian
-        attrs["betatotal"] = cpp_wout.betatot
-        attrs["volavgB"] = cpp_wout.VolAvgB
-        attrs["iotaf"] = cpp_wout.iota_full
-        attrs["q_factor"] = cpp_wout.safety_factor
-        attrs["presf"] = cpp_wout.pressure_full
-        attrs["phi"] = cpp_wout.toroidal_flux
-        attrs["chi"] = cpp_wout.poloidal_flux
-        attrs["beta_vol"] = cpp_wout.beta
-        attrs["specw"] = cpp_wout.spectral_width
-        attrs["DShear"] = cpp_wout.Dshear
-        attrs["DWell"] = cpp_wout.Dwell
-        attrs["DCurr"] = cpp_wout.Dcurr
-        attrs["DGeod"] = cpp_wout.Dgeod
-        attrs["raxis_cc"] = cpp_wout.raxis_c
-        attrs["zaxis_cs"] = cpp_wout.zaxis_s
-
-        # These attributes have one element more in VMEC2000
-        # (i.e. they have size ns instead of ns - 1).
-        # VMEC2000 then indexes them as with [1:], so we pad VMEC++'s.
-        # And they might be called differently.
-        attrs["bvco"] = np.concatenate(([0.0], cpp_wout.bvco))
-        attrs["buco"] = np.concatenate(([0.0], cpp_wout.buco))
-        attrs["vp"] = np.concatenate(([0.0], cpp_wout.dVds))
-        attrs["pres"] = np.concatenate(([0.0], cpp_wout.pressure_half))
-        attrs["mass"] = np.concatenate(([0.0], cpp_wout.mass))
-        attrs["beta_vol"] = np.concatenate(([0.0], cpp_wout.beta))
-        attrs["phips"] = np.concatenate(([0.0], cpp_wout.phips))
-        attrs["over_r"] = np.concatenate(([0.0], cpp_wout.overr))
-        attrs["iotas"] = np.concatenate(([0.0], cpp_wout.iota_half))
-
-        # These attributes are transposed in SIMSOPT/Fortran VMEC
-        attrs["rmnc"] = cpp_wout.rmnc.T
-        attrs["zmns"] = cpp_wout.zmns.T
-        attrs["bsubsmns"] = cpp_wout.bsubsmns.T
-
-        # This is a VMEC++-only quantity but it's transposed when
-        # stored in a wout file for consistency with lmns.
-        attrs["lmns_full"] = cpp_wout.lmns_full.T
-
-        # Asymmetric attributes are transposed and only populated when lasym=True
+        # Asymmetric attributes are only populated when lasym=True
         # All of them are defaulted to None when lasym=False
         if cpp_wout.lasym:
-            attrs["raxis_cs"] = cpp_wout.raxis_s
-            attrs["zaxis_cc"] = cpp_wout.zaxis_c
+            attrs["raxis_cs"] = cpp_wout.raxis_cs
+            attrs["zaxis_cc"] = cpp_wout.zaxis_cc
 
-            attrs["bsubsmnc"] = cpp_wout.bsubsmnc.T
-            attrs["rmns"] = cpp_wout.rmns.T
-            attrs["zmnc"] = cpp_wout.zmnc.T
-            attrs["lmnc_full"] = cpp_wout.lmnc_full.T
+            # Full-grid asymmetric 2D arrays
+            attrs["rmns"] = cpp_wout.rmns
+            attrs["zmnc"] = cpp_wout.zmnc
+            attrs["lmnc_full"] = cpp_wout.lmnc_full
+            attrs["bsubsmnc"] = cpp_wout.bsubsmnc
 
-            attrs["lmnc"] = _pad_and_transpose(cpp_wout.lmnc, attrs["mnmax"])
-
-            attrs["bmns"] = _pad_and_transpose(cpp_wout.bmns, attrs["mnmax_nyq"])
-            attrs["bsubumns"] = _pad_and_transpose(
-                cpp_wout.bsubumns, attrs["mnmax_nyq"]
-            )
-            attrs["bsubvmns"] = _pad_and_transpose(
-                cpp_wout.bsubvmns, attrs["mnmax_nyq"]
-            )
-            attrs["bsupumns"] = _pad_and_transpose(
-                cpp_wout.bsupumns, attrs["mnmax_nyq"]
-            )
-            attrs["bsupvmns"] = _pad_and_transpose(
-                cpp_wout.bsupvmns, attrs["mnmax_nyq"]
-            )
-            attrs["gmns"] = _pad_and_transpose(cpp_wout.gmns, attrs["mnmax_nyq"])
-
-        # These attributes have one column less and their elements are transposed
-        # in VMEC++ with respect to SIMSOPT/VMEC2000
-        attrs["lmns"] = _pad_and_transpose(cpp_wout.lmns, attrs["mnmax"])
-
-        attrs["bmnc"] = _pad_and_transpose(cpp_wout.bmnc, attrs["mnmax_nyq"])
-        attrs["bsubumnc"] = _pad_and_transpose(cpp_wout.bsubumnc, attrs["mnmax_nyq"])
-        attrs["bsubvmnc"] = _pad_and_transpose(cpp_wout.bsubvmnc, attrs["mnmax_nyq"])
-        attrs["bsupumnc"] = _pad_and_transpose(cpp_wout.bsupumnc, attrs["mnmax_nyq"])
-        attrs["bsupvmnc"] = _pad_and_transpose(cpp_wout.bsupvmnc, attrs["mnmax_nyq"])
-        attrs["gmnc"] = _pad_and_transpose(cpp_wout.gmnc, attrs["mnmax_nyq"])
-
-        # These attributes have zero-padding at the end up to a fixed length
-        attrs["am"] = _util.right_pad(cpp_wout.am, preset)
-        attrs["ac"] = _util.right_pad(cpp_wout.ac, preset)
-        attrs["ai"] = _util.right_pad(cpp_wout.ai, preset)
-        attrs["am_aux_s"] = _util.right_pad(cpp_wout.am_aux_s, ndfmax, -1.0)
-        attrs["am_aux_f"] = _util.right_pad(cpp_wout.am_aux_f, ndfmax)
-        attrs["ac_aux_s"] = _util.right_pad(cpp_wout.ac_aux_s, ndfmax, -1.0)
-        attrs["ac_aux_f"] = _util.right_pad(cpp_wout.ac_aux_f, ndfmax)
-        attrs["ai_aux_s"] = _util.right_pad(cpp_wout.ai_aux_s, ndfmax, -1.0)
-        attrs["ai_aux_f"] = _util.right_pad(cpp_wout.ai_aux_f, ndfmax)
-
-        attrs["restart_reason_timetrace"] = cpp_wout.restart_reasons
-
-        attrs["version_"] = float(cpp_wout.version)
-
-        # lrfp is Python-only (not in C++ WOutFileContents), default to False
-        attrs["lrfp"] = False
+            # Half-grid asymmetric 2D arrays
+            attrs["lmnc"] = cpp_wout.lmnc
+            attrs["bmns"] = cpp_wout.bmns
+            attrs["bsubumns"] = cpp_wout.bsubumns
+            attrs["bsubvmns"] = cpp_wout.bsubvmns
+            attrs["bsupumns"] = cpp_wout.bsupumns
+            attrs["bsupvmns"] = cpp_wout.bsupvmns
+            attrs["gmns"] = cpp_wout.gmns
 
         return VmecWOut(**attrs)
 
@@ -1542,93 +1421,27 @@ class VmecWOut(BaseModelWithNumpy):
             if field not in VmecWOut._CPP_WOUT_SPECIAL_HANDLING:
                 setattr(cpp_wout, field, getattr(self, field))
 
-        # These attributes are called differently
-        cpp_wout.volume_p = self.volume
-        cpp_wout.maximum_iterations = self.niter
-        cpp_wout.sign_of_jacobian = self.signgs
-        cpp_wout.betatot = self.betatotal
-        cpp_wout.VolAvgB = self.volavgB
-        cpp_wout.iota_full = self.iotaf
-        cpp_wout.safety_factor = self.q_factor
-        cpp_wout.pressure_full = self.presf
-        cpp_wout.toroidal_flux = self.phi
-        cpp_wout.poloidal_flux = self.chi
-        cpp_wout.beta = self.beta_vol
-        cpp_wout.spectral_width = self.specw
-        cpp_wout.Dshear = self.DShear
-        cpp_wout.Dwell = self.DWell
-        cpp_wout.Dcurr = self.DCurr
-        cpp_wout.Dgeod = self.DGeod
-        cpp_wout.raxis_c = self.raxis_cc
-        cpp_wout.zaxis_s = self.zaxis_cs
-        cpp_wout.version = str(self.version_)  # also needs a float -> str conversion
-
-        # These attributes have one element more in VMEC2000
-        # (i.e. they have size ns instead of ns - 1).
-        # VMEC2000 then indexes them as with [1:], so we pad VMEC++'s.
-        # And they might be called differently.
-        cpp_wout.bvco = self.bvco[1:]
-        cpp_wout.buco = self.buco[1:]
-        cpp_wout.dVds = self.vp[1:]
-        cpp_wout.pressure_half = self.pres[1:]
-        cpp_wout.mass = self.mass[1:]
-        cpp_wout.beta = self.beta_vol[1:]
-        cpp_wout.phips = self.phips[1:]
-        cpp_wout.overr = self.over_r[1:]
-        cpp_wout.iota_half = self.iotas[1:]
-
-        # These attributes are transposed in SIMSOPT
-        cpp_wout.rmnc = self.rmnc.T
-        cpp_wout.zmns = self.zmns.T
-        cpp_wout.bsubsmns = self.bsubsmns.T
-
-        # This is a VMEC++-only quantity but it's transposed when
-        # stored in a wout file for consistency with lmns.
-        cpp_wout.lmns_full = self.lmns_full.T
-
+        # Asymmetric fields (only set when lasym=True)
         if self.lasym:
-            cpp_wout.raxis_s = self.raxis_cs
-            cpp_wout.zaxis_c = self.zaxis_cc
-        # Asymmetric attributes are transposed and only set when lasym=True
-        for field in [
-            "bsubsmnc",
-            "rmns",
-            "zmnc",
-            "lmnc_full",
-            "lmnc",
-            "bmns",
-        ]:
-            value = getattr(self, field)
-            if value is not None:
-                setattr(cpp_wout, field, value.T)
+            cpp_wout.raxis_cs = self.raxis_cs
+            cpp_wout.zaxis_cc = self.zaxis_cc
 
-        # This is a VMEC++ only quantity
-        cpp_wout.restart_reasons = self.restart_reason_timetrace
-
-        # coefficients on half-grid
-        # These attributes have one column less and their elements are transposed
-        # in VMEC++ with respect to SIMSOPT/VMEC2000
-        for field in [
-            "lmns",
-            "gmnc",
-            "bmnc",
-            "bsubumnc",
-            "bsubvmnc",
-            "bsupumnc",
-            "bsupvmnc",
-            # Asymmetric coefficients (only when lasym=True)
-            "lmnc",
-            "gmns",
-            "bmns",
-            "bsubumns",
-            "bsubvmns",
-            "bsupumns",
-            "bsupvmns",
-        ]:
-            value = getattr(self, field)
-            # Asymmetric coefficients may be None when lasym=False
-            if value is not None:
-                setattr(cpp_wout, field, value.T[1:, :])
+            for field in [
+                "rmns",
+                "zmnc",
+                "lmnc_full",
+                "bsubsmnc",
+                "lmnc",
+                "gmns",
+                "bmns",
+                "bsubumns",
+                "bsubvmns",
+                "bsupumns",
+                "bsupvmns",
+            ]:
+                value = getattr(self, field)
+                if value is not None:
+                    setattr(cpp_wout, field, value)
 
         return cpp_wout
 
@@ -1971,8 +1784,8 @@ def run(
         >>> path = "examples/data/solovev.json"
         >>> vmec_input = vmecpp.VmecInput.from_file(path)
         >>> output = vmecpp.run(vmec_input, verbose=False, max_threads=1)
-        >>> round(output.wout.b0, 14) # Exact value may differ by C library
-        0.20333137113443
+        >>> round(output.wout.b0, 10) # Exact value may differ by C library
+        0.2033313711
     """
     input = VmecInput.model_validate(input)
     cpp_indata = input._to_cpp_vmecindata()
@@ -2126,17 +1939,6 @@ def ensure_vmec2000_input(input_path: Path) -> Generator[Path, None, None]:
         with open(out_path, "w") as out_f:
             out_f.write(indata_contents)
         yield out_path
-
-
-def _pad_and_transpose(
-    arr: jt.Float[np.ndarray, "ns_minus_one mn"] | None, mnsize: int
-) -> jt.Float[np.ndarray, "mn ns"] | None:
-    if arr is None:
-        return None
-    stacked = np.vstack((np.zeros(mnsize), arr)).T
-    assert stacked.shape[1] == arr.shape[0] + 1
-    assert stacked.shape[0] == arr.shape[1]
-    return stacked
 
 
 def set_profile(
