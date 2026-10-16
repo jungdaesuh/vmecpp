@@ -205,6 +205,32 @@ absl::Status CheckConstructorArguments(const VmecINDATA& indata,
   }
   return absl::OkStatus();
 }
+
+// Checks a loaded mgrid against the run's effective toroidal grid and periods.
+absl::Status CheckMgridConsistency(const MGridProvider& mgrid,
+                                   const Sizes& sizes,
+                                   const VmecINDATA& indata) {
+  if (mgrid.numPhi != sizes.nZeta) {
+    const std::string raised_from =
+        sizes.nZeta == indata.nzeta
+            ? ""
+            : absl::StrFormat(
+                  " (nzeta = %d in VmecINDATA, raised to the "
+                  "minimum for ntor = %d)",
+                  indata.nzeta, indata.ntor);
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "MGridProvider has %d phi grid points, but the run has %d toroidal "
+        "grid points%s. Please ensure that the two are consistent.",
+        mgrid.numPhi, sizes.nZeta, raised_from));
+  }
+  if (mgrid.nfp != indata.nfp) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "MGridProvider has %d field periods, but VmecINDATA has nfp = %d. "
+        "Please ensure that the two are consistent.",
+        mgrid.nfp, indata.nfp));
+  }
+  return absl::OkStatus();
+}
 }  // namespace
 
 absl::StatusOr<std::unique_ptr<Vmec>> Vmec::FromIndata(
@@ -232,6 +258,10 @@ absl::StatusOr<std::unique_ptr<Vmec>> Vmec::FromIndata(
     } else {
       s = v->mgrid_.LoadFields(*magnetic_response_table, indata.extcur);
     }
+    if (!s.ok()) {
+      return s;
+    }
+    s = CheckMgridConsistency(v->mgrid_, v->s_, indata);
     if (!s.ok()) {
       return s;
     }
@@ -353,26 +383,9 @@ absl::StatusOr<bool> Vmec::run(const VmecCheckpoint& checkpoint,
     magnetic_field_ = std::bind_front(&MGridProvider::interpolate, &mgrid_);
   }
   if (indata_.lfreeb && mgrid_.IsLoaded()) {
-    // Sizes raises nzeta to the minimum ntor allows, so s_.nZeta is the
-    // toroidal resolution of the run.
-    if (mgrid_.numPhi != s_.nZeta) {
-      const std::string raised_from =
-          s_.nZeta == indata_.nzeta
-              ? ""
-              : absl::StrFormat(
-                    " (nzeta = %d in VmecINDATA, raised to the "
-                    "minimum for ntor = %d)",
-                    indata_.nzeta, indata_.ntor);
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "MGridProvider has %d phi grid points, but the run has %d toroidal "
-          "grid points%s. Please ensure that the two are consistent.",
-          mgrid_.numPhi, s_.nZeta, raised_from));
-    }
-    if (mgrid_.nfp != indata_.nfp) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "MGridProvider has %d field periods, but VmecINDATA has nfp = %d. "
-          "Please ensure that the two are consistent.",
-          mgrid_.nfp, indata_.nfp));
+    absl::Status status = CheckMgridConsistency(mgrid_, s_, indata_);
+    if (!status.ok()) {
+      return status;
     }
   }
 
