@@ -112,6 +112,46 @@ def test_raise_invalid_nzeta():
         vmecpp.run(vmec_input, response, verbose=False)
 
 
+@pytest.fixture(params=["fewer_planes", "more_planes", "field_periods"])
+def incompatible_mgrid_input(request):
+    vmec_input = vmecpp.VmecInput.from_file(TEST_DATA_DIR / "cth_like_free_bdy.json")
+    vmec_input.mgrid_file = str(TEST_DATA_DIR / "mgrid_cth_like.nc")
+    vmec_input.niter_array = np.array([1])
+    if request.param == "field_periods":
+        vmec_input.nfp = 6
+    else:
+        vmec_input.nzeta = 24 if request.param == "fewer_planes" else 48
+    return vmec_input
+
+
+def create_model(vmec_input):
+    return vmecpp._vmecpp.VmecModel.create(
+        vmec_input._to_cpp_vmecindata(), int(vmec_input.ns_array[0])
+    )
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [create_model, vmecpp.iterate, vmecpp.solve_multigrid],
+    ids=["create", "iterate", "solve_multigrid"],
+)
+def test_model_rejects_incompatible_mgrid(incompatible_mgrid_input, entrypoint):
+    """Model entry points reject file metadata before evaluating the field."""
+    with pytest.raises(
+        RuntimeError,
+        match=r"MGridProvider has (36 phi grid points|5 field periods)",
+    ):
+        entrypoint(incompatible_mgrid_input)
+
+
+def test_run_rejects_incompatible_mgrid_file(incompatible_mgrid_input):
+    with pytest.raises(
+        ValueError,
+        match=r"MGridProvider has (36 phi grid points|5 field periods)",
+    ):
+        vmecpp.run(incompatible_mgrid_input, verbose=False)
+
+
 def test_makegrid_parameters_conversion(makegrid_params):
     # Convert resolution parameters to C++ and back to Python
     cpp_params = makegrid_params._to_cpp_makegrid_parameters()

@@ -249,6 +249,161 @@ TEST(TestVmec, CheckFromIndataSetsMagneticField) {
   EXPECT_TRUE(static_cast<bool>((*maybe_vmec)->magnetic_field_));
 }  // CheckFromIndataSetsMagneticField
 
+class MgridConsistencyTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    const auto indata_json =
+        ReadFile("vmecpp/test_data/cth_like_free_bdy.json");
+    ASSERT_TRUE(indata_json.ok()) << indata_json.status();
+    const auto maybe_indata = VmecINDATA::FromJson(*indata_json);
+    ASSERT_TRUE(maybe_indata.ok()) << maybe_indata.status();
+    indata_ = *maybe_indata;
+  }
+
+  makegrid::MagneticFieldResponseTable ResponseTable(int nzeta, int nfp) const {
+    makegrid::MagneticFieldResponseTable table;
+    table.parameters.number_of_field_periods = nfp;
+    table.parameters.number_of_phi_grid_points = nzeta;
+    table.parameters.number_of_r_grid_points = 4;
+    table.parameters.r_grid_minimum = 0.1;
+    table.parameters.r_grid_maximum = 2.0;
+    table.parameters.number_of_z_grid_points = 4;
+    table.parameters.z_grid_minimum = -1.0;
+    table.parameters.z_grid_maximum = 1.0;
+    table.b_r.setZero(indata_.extcur.size(), nzeta * 4 * 4);
+    table.b_p.setOnes(indata_.extcur.size(), nzeta * 4 * 4);
+    table.b_z.setZero(indata_.extcur.size(), nzeta * 4 * 4);
+    return table;
+  }
+
+  void ExpectInvalidArgument(const absl::Status& status,
+                             const std::string& expected_message) const {
+    EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_THAT(std::string(status.message()),
+                ::testing::HasSubstr(expected_message));
+  }
+
+  VmecINDATA indata_;
+};
+
+TEST_F(MgridConsistencyTest, FactoryRejectsIncompatibleFilePlaneCounts) {
+  // The fixture file has 36 planes; both coarser and finer runs must reject it.
+  for (const int nzeta : {24, 48}) {
+    SCOPED_TRACE(nzeta);
+    indata_.nzeta = nzeta;
+    const auto maybe_vmec = Vmec::FromIndata(indata_);
+    ExpectInvalidArgument(maybe_vmec.status(),
+                          "MGridProvider has 36 phi grid points");
+  }
+}
+
+TEST_F(MgridConsistencyTest, FactoryRejectsIncompatibleFileFieldPeriods) {
+  indata_.nfp = 6;
+  ExpectInvalidArgument(Vmec::FromIndata(indata_).status(),
+                        "MGridProvider has 5 field periods");
+}
+
+TEST_F(MgridConsistencyTest, FactoryRejectsIncompatibleTablePlaneCounts) {
+  for (const int nzeta : {24, 48}) {
+    SCOPED_TRACE(nzeta);
+    const auto table = ResponseTable(nzeta, indata_.nfp);
+    const auto maybe_vmec = Vmec::FromIndata(indata_, &table);
+    ExpectInvalidArgument(
+        maybe_vmec.status(),
+        absl::StrFormat("MGridProvider has %d phi grid points", nzeta));
+  }
+}
+
+TEST_F(MgridConsistencyTest, FactoryRejectsIncompatibleTableFieldPeriods) {
+  const auto table = ResponseTable(indata_.nzeta, 6);
+  ExpectInvalidArgument(Vmec::FromIndata(indata_, &table).status(),
+                        "MGridProvider has 6 field periods");
+}
+
+TEST_F(MgridConsistencyTest, FactoryRejectsAlignedUnequalTablePlaneCounts) {
+  // Every solver plane aligns with every second table plane, but the factory
+  // requires matching plane counts even when interpolation could sample them.
+  indata_.nzeta = 48;
+  const auto table = ResponseTable(96, indata_.nfp);
+  ExpectInvalidArgument(
+      Vmec::FromIndata(indata_, &table).status(),
+      "MGridProvider has 96 phi grid points, but the run has 48 toroidal grid "
+      "points");
+}
+
+TEST_F(MgridConsistencyTest, FactoryAcceptsMatchingTable) {
+  const auto table = ResponseTable(indata_.nzeta, indata_.nfp);
+  const auto maybe_vmec = Vmec::FromIndata(indata_, &table);
+  ASSERT_TRUE(maybe_vmec.ok()) << maybe_vmec.status();
+}
+
+TEST_F(MgridConsistencyTest, FactoryUsesEffectivePlasmaToroidalResolution) {
+  indata_.nzeta = 6;
+  ASSERT_TRUE(vmecpp::IsConsistent(indata_, false).ok());
+  const auto matching_table = ResponseTable(12, indata_.nfp);
+  const auto accepted = Vmec::FromIndata(indata_, &matching_table);
+  ASSERT_TRUE(accepted.ok()) << accepted.status();
+
+  const auto raw_resolution_table = ResponseTable(6, indata_.nfp);
+  ExpectInvalidArgument(
+      Vmec::FromIndata(indata_, &raw_resolution_table).status(),
+      "the run has 12 toroidal grid points");
+}
+
+TEST_F(MgridConsistencyTest, FactoryUsesEffectiveVacuumToroidalResolution) {
+  indata_.nzeta = 0;
+  indata_.vacuum_ntor = 7;
+  ASSERT_TRUE(vmecpp::IsConsistent(indata_, false).ok());
+  const auto matching_table = ResponseTable(18, indata_.nfp);
+  const auto accepted = Vmec::FromIndata(indata_, &matching_table);
+  ASSERT_TRUE(accepted.ok()) << accepted.status();
+
+  const auto plasma_resolution_table = ResponseTable(12, indata_.nfp);
+  ExpectInvalidArgument(
+      Vmec::FromIndata(indata_, &plasma_resolution_table).status(),
+      "the run has 18 toroidal grid points");
+}
+
+TEST_F(MgridConsistencyTest, DirectConstructorRunRejectsIncompatibleFile) {
+  for (const bool wrong_nfp : {false, true}) {
+    SCOPED_TRACE(wrong_nfp);
+    indata_.nzeta = wrong_nfp ? 36 : 24;
+    indata_.nfp = wrong_nfp ? 6 : 5;
+    Vmec vmec(indata_, /*max_threads=*/1, vmecpp::OutputMode::kSilent);
+    const auto reached_checkpoint =
+        vmec.run(VmecCheckpoint::SETUP_INITIAL_STATE);
+    const std::string expected_message =
+        wrong_nfp ? "MGridProvider has 5 field periods"
+                  : "MGridProvider has 36 phi grid points";
+    ExpectInvalidArgument(reached_checkpoint.status(), expected_message);
+  }
+}
+
+TEST_F(MgridConsistencyTest, FixedBoundaryFactoryIgnoresUnusedMgrid) {
+  indata_.lfreeb = false;
+  indata_.mgrid_file = "/does/not/exist/mgrid.nc";
+  const auto from_file = Vmec::FromIndata(indata_);
+  ASSERT_TRUE(from_file.ok()) << from_file.status();
+  const auto table = ResponseTable(24, 6);
+  const auto from_table = Vmec::FromIndata(indata_, &table);
+  ASSERT_TRUE(from_table.ok()) << from_table.status();
+}
+
+TEST_F(MgridConsistencyTest, CallableFactoryDoesNotRequireMgrid) {
+  indata_.mgrid_file = "/does/not/exist/mgrid.nc";
+  const vmecpp::MagneticFieldFunction field =
+      [](const Eigen::VectorXd& r, const Eigen::VectorXd&,
+         const Eigen::VectorXd&, Eigen::VectorXd& m_b_r,
+         Eigen::VectorXd& m_b_phi, Eigen::VectorXd& m_b_z) {
+        m_b_r.setZero(r.size());
+        m_b_phi.setOnes(r.size());
+        m_b_z.setZero(r.size());
+        return absl::OkStatus();
+      };
+  const auto maybe_vmec = Vmec::FromIndata(indata_, field);
+  ASSERT_TRUE(maybe_vmec.ok()) << maybe_vmec.status();
+}
+
 // A thread count below 1 is an error status, not a failed check in FlowControl.
 TEST(TestVmec, CheckRunRejectsAThreadCountBelowOne) {
   const std::string filename = "vmecpp/test_data/solovev.json";
