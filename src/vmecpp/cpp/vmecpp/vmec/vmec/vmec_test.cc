@@ -320,6 +320,17 @@ TEST_F(MgridConsistencyTest, FactoryRejectsIncompatibleTableFieldPeriods) {
                         "MGridProvider has 6 field periods");
 }
 
+TEST_F(MgridConsistencyTest, FactoryRejectsAlignedUnequalTablePlaneCounts) {
+  // Every solver plane aligns with every second table plane, but the factory
+  // requires matching plane counts even when interpolation could sample them.
+  indata_.nzeta = 48;
+  const auto table = ResponseTable(96, indata_.nfp);
+  ExpectInvalidArgument(
+      Vmec::FromIndata(indata_, &table).status(),
+      "MGridProvider has 96 phi grid points, but the run has 48 toroidal grid "
+      "points");
+}
+
 TEST_F(MgridConsistencyTest, FactoryAcceptsMatchingTable) {
   const auto table = ResponseTable(indata_.nzeta, indata_.nfp);
   const auto maybe_vmec = Vmec::FromIndata(indata_, &table);
